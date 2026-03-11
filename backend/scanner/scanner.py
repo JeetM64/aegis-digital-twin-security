@@ -1,804 +1,353 @@
-# scanner.py
-
 """
-Scanner orchestrator (XML-based)
-- Runs nmap via scanner.nmap_runner (which returns XML on stdout)
-- Captures stderr lines into Scan.log (live) using a thread-safe flusher
-- Persists Scan, VM and Vulnerability rows via writer.write_host_and_vulns
-- Supports CLI: python -m scanner.scanner --target --mode fast|medium|full --no-parse
+Real scanning pipeline:
+
+  1. nmap_runner   → run nmap with vuln scripts, capture XML
+  2. xml_parser    → parse hosts / ports / script output
+  3. cve_parser    → extract CVE ids from script output + NVD enrichment
+  4. risk_model    → ML probability for each port/service
+  5. prioritization→ composite score
+  6. DB write      → Vulnerability rows with full data
 """
 
-import datetime as _dt
-import ipaddress
-import threading
-import queue
-from typing import Optional, List, Dict, Any
+import logging
+from datetime import datetime
+from typing import Optional
 
-# relative imports to other modules in the scanner package
-from scanner.nmap_runner import build_nmap_cmd, run_nmap_and_capture_xml
-from scanner.xml_parser import parse_nmap_xml
-from scanner.cve_parser import extract_cves_from_text
-from scanner.writer import write_host_and_vulns
+from models import db, Scan, Vulnerability, VM
 
-# models (project-level module; keep absolute import)
-from models import Scan, db
+from scanner.nmap_runner  import build_nmap_cmd, run_nmap_and_capture_xml
+from scanner.xml_parser   import parse_nmap_xml
+from scanner.cve_parser   import (
+    extract_cves_from_text,
+    enrich_cves,
+    fetch_cves_for_service,
+)
+from ml.risk_model import predict_risk, SERVICE_RISK_MAP, INTERNET_PORTS
+from ai.prioritization import prioritize_vulnerabilities
 
-# Use sessionmaker for flusher thread DB sessions
-from sqlalchemy.orm import sessionmaker
+logger = logging.getLogger(__name__)
 
-# Simple numeric estimate mapping (seconds per host). Use these to compute ETA timestamp.
-_MODE_ESTIMATE_SECONDS = {
-    "fast": 120,    # 2 minutes
-    "medium": 360,  # 6 minutes
-    "full": 900     # 15 minutes
-}
+# Ports where anonymous / open access is common (misconfig flag)
+OPEN_BY_DEFAULT = {21, 23, 25, 53, 80, 2379, 6379, 9200, 11211, 27017}
+
+# Services that should require auth – flag if they appear without it
+AUTH_REQUIRED = {3306, 5432, 1433, 1521, 27017, 6379, 9200, 2379, 11211}
 
 
-def classify_risk_from_script(sid: str, out: str):
+# ─────────────────────────────────────────────────────────────────────────────
+def run_scan(scan_id: int, target: str, mode: str = "fast"):
     """
-    Very simple ISO 27005 style risk classification:
-    - Decide likelihood and impact from the script output
-    - Compute risk_score = likelihood_score * impact_score  (1-25)
+    Entry point called from scan_routes.py in a background thread.
     """
-    text = (out or "").lower()
-    sid_lower = sid.lower()
+    scan = db.session.get(Scan, scan_id)
+    if not scan:
+        logger.error("Scan %s not found", scan_id)
+        return
 
-    # Example heuristic rules - you can tweak these anytime
-    if "remote code execution" in text or "exec arbitrary code" in text:
-        likelihood = "High"
-        impact = "High"
-    elif "authentication bypass" in text or "default credentials" in text or "anonymous login" in text:
-        likelihood = "High"
-        impact = "Medium"
-    elif "privilege escalation" in text:
-        likelihood = "Medium"
-        impact = "High"
-    elif "information disclosure" in text or "sensitive information" in text:
-        likelihood = "Medium"
-        impact = "Medium"
-    elif "weak cipher" in text or "ssl" in sid_lower or "tls" in sid_lower:
-        likelihood = "Medium"
-        impact = "Low"
-    else:
-        # fallback for generic findings
-        likelihood = "Medium"
-        impact = "Medium"
-
-    scale = {"Low": 1, "Medium": 3, "High": 5}
-    risk_score = scale[likelihood] * scale[impact]  # 1–25
-
-    return likelihood, impact, risk_score
-
-
-def emit_progress(scan_id, progress, phase, message='', eta=None):
-    """Emit real-time scan progress via SocketIO"""
     try:
-        from flask import current_app
-        socketio = current_app.socketio
-        
-        # Update database
-        try:
-            scan = db.session.get(Scan, scan_id)
-            if scan:
-                scan.progress = progress
-                scan.phase = phase
-                scan.status = 'running' if progress < 100 else 'completed'
-                if eta:
-                    scan.eta = eta
-                
-                # Append to log_data
-                timestamp = _dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                log_entry = f"[{timestamp}] [{phase}] {progress}% - {message}"
-                if hasattr(scan, 'log_data') and scan.log_data:
-                    scan.log_data = scan.log_data + '\n' + log_entry
-                else:
-                    scan.log_data = log_entry
-                
-                db.session.commit()
-        except Exception:
-            pass
-        
-        # Emit WebSocket event
-        socketio.emit('scan_progress', {
-            'scan_id': scan_id,
-            'progress': progress,
-            'phase': phase,
-            'status': 'running' if progress < 100 else 'completed',
-            'message': message,
-            'eta': eta or '',
-            'timestamp': _dt.datetime.now(_dt.timezone.utc).isoformat()
-        })
-        
-        # Also emit legacy event for compatibility
-        socketio.emit('scan_update', {
-            'scan_id': scan_id,
-            'status': 'running' if progress < 100 else 'completed',
-            'progress': progress,
-            'phase': phase
-        })
-        
-        print(f"✅ Emitted: Scan {scan_id} - {progress}% - {phase}")
-        
+        _update(scan, status="running", phase="initialising", progress=2)
+
+        # ── Step 1: build + run nmap ──────────────────────────────────────────
+        cmd = build_nmap_cmd(target, mode=mode)
+        logger.info("[scan %s] nmap cmd: %s", scan_id, " ".join(cmd))
+
+        _update(scan, phase="scanning", progress=10)
+
+        timeout_map = {"fast": 300, "medium": 600, "deep": 1800}
+        rc, xml_output, stderr = run_nmap_and_capture_xml(
+            cmd,
+            stderr_line_cb=lambda line: logger.debug("[nmap] %s", line),
+            timeout=timeout_map.get(mode, 300),
+        )
+
+        if not xml_output:
+            raise RuntimeError(
+                f"nmap returned no XML output (rc={rc}). stderr tail:\n{stderr[-500:]}"
+            )
+
+        _update(scan, phase="parsing results", progress=40)
+
+        # ── Step 2: parse XML ─────────────────────────────────────────────────
+        hosts = parse_nmap_xml(xml_output)
+        logger.info("[scan %s] parsed %d host(s)", scan_id, len(hosts))
+
+        if not hosts:
+            _finish(scan, status="completed", progress=100,
+                    phase="completed – no hosts found")
+            return
+
+        # ── Step 3–6: process each open port ─────────────────────────────────
+        _update(scan, phase="analysing vulnerabilities", progress=55)
+
+        total_ports = sum(
+            1 for h in hosts
+            for p in h.get("ports", [])
+            if p.get("state") == "open"
+        )
+        processed = 0
+
+        for host in hosts:
+            ip       = host.get("ip", target)
+            hostname = host.get("hostname") or ip
+            os_name  = host.get("os") or "Unknown"
+
+            # Upsert VM record
+            _upsert_vm(ip, hostname, os_name)
+
+            for port_data in host.get("ports", []):
+                if port_data.get("state") != "open":
+                    continue
+
+                try:
+                    _process_port(scan_id, ip, port_data)
+                except Exception as e:
+                    logger.warning(
+                        "[scan %s] port %s processing error: %s",
+                        scan_id, port_data.get("port"), e,
+                    )
+
+                processed += 1
+                progress = 55 + int((processed / max(total_ports, 1)) * 35)
+                _update(scan, progress=min(progress, 90))
+
+        # ── Step 7: final prioritization pass ────────────────────────────────
+        _update(scan, phase="prioritising", progress=92)
+        _reprioritize_scan(scan_id)
+
+        _finish(scan, status="completed", progress=100, phase="completed")
+        logger.info("[scan %s] finished successfully", scan_id)
+
     except Exception as e:
-        print(f"❌ Failed to emit progress: {e}")
+        logger.exception("[scan %s] fatal error: %s", scan_id, e)
+        scan = db.session.get(Scan, scan_id)
+        if scan:
+            _finish(scan, status="failed",
+                    phase=f"failed: {str(e)[:200]}", progress=scan.progress or 0)
 
 
-# Bounded queue for stderr lines (thread-safe)
-_stderr_queue = queue.Queue(maxsize=5000)
-
-
-def validate_target(target: str) -> bool:
+# ─────────────────────────────────────────────────────────────────────────────
+def _process_port(scan_id: int, ip: str, port_data: dict):
     """
-    Accept single IP or CIDR or simple hostname. Reject other shells/commands.
+    Full analysis for one open port:
+      CVE extraction → NVD enrichment → ML risk → DB write.
     """
-    if not target or not isinstance(target, str):
-        return False
-    
-    target = target.strip()
-    
-    # allow IP or CIDR
+    port        = int(port_data["port"])
+    svc_info    = port_data.get("service", {})
+    service     = svc_info.get("name", "unknown")
+    version     = _build_version_string(svc_info)
+    scripts     = port_data.get("scripts", {})
+
+    # ── CVE extraction from nmap script output ────────────────────────────────
+    script_text = "\n".join(scripts.values())
+    cves        = extract_cves_from_text(script_text)
+
+    # If scripts found CVEs, enrich them from NVD
+    if cves:
+        cves = enrich_cves(cves)
+    else:
+        # No CVEs in script output → query NVD by service + version keyword
+        cves = fetch_cves_for_service(service, version, max_results=3)
+
+    # Derive best CVSS from CVE list
+    cvss = _best_cvss(cves, port, service)
+
+    # ── Flags ─────────────────────────────────────────────────────────────────
+    exploit_found = _has_exploit(script_text)
+    misconfig     = _is_misconfigured(port, service, script_text)
+    cve_count     = len(cves)
+    cve_ids_str   = ",".join(c["cve_id"] for c in cves[:10])
+
+    # ── ML risk prediction ────────────────────────────────────────────────────
+    ml_prob = predict_risk(
+        port          = port,
+        cvss          = cvss,
+        service       = service,
+        cve_count     = cve_count,
+        exploit_found = exploit_found,
+        misconfig     = misconfig,
+        network_depth = 0,     # perimeter assumption; can be passed from caller
+        critical_asset= port in AUTH_REQUIRED,
+        patch_age     = _estimate_patch_age(version),
+    )
+    ai_risk_score = round(ml_prob * 20, 2)   # scale to 0-20 for DB
+
+    # ── Severity from CVSS ────────────────────────────────────────────────────
+    severity = _cvss_to_severity(cvss)
+
+    # ── Build description ─────────────────────────────────────────────────────
+    description = _build_description(port, service, version, cves, exploit_found, misconfig)
+
+    vuln = Vulnerability(
+        scan_id     = scan_id,
+        port        = port,
+        service     = service,
+        version     = version,
+        severity    = severity,
+        description = description,
+        cvss_score  = cvss,
+        risk_score  = ai_risk_score,
+        cve_ids     = cve_ids_str,
+        cve_count   = cve_count,
+    )
+    db.session.add(vuln)
+    db.session.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reprioritize_scan(scan_id: int):
+    """Re-run prioritization on all vulns of a scan and update risk_score."""
+    vulns = Vulnerability.query.filter_by(scan_id=scan_id).all()
+    ranked = prioritize_vulnerabilities(vulns)
+    for (v, score) in ranked:
+        v.risk_score = round(score, 2)
+    db.session.commit()
+
+
+def _upsert_vm(ip: str, hostname: str, os_name: str):
     try:
-        ipaddress.ip_network(target, strict=False)
+        vm = VM.query.filter_by(ip_address=ip).first()
+        if vm:
+            vm.hostname = hostname or vm.hostname
+            vm.os       = os_name  or vm.os
+        else:
+            vm = VM(ip_address=ip, hostname=hostname, os=os_name, status="active")
+            db.session.add(vm)
+        db.session.commit()
+    except Exception as e:
+        logger.warning("VM upsert failed for %s: %s", ip, e)
+        db.session.rollback()
+
+
+def _build_version_string(svc_info: dict) -> str:
+    parts = [
+        svc_info.get("product", ""),
+        svc_info.get("version", ""),
+        svc_info.get("extrainfo", ""),
+    ]
+    return " ".join(p for p in parts if p).strip()
+
+
+def _best_cvss(cves: list, port: int, service: str) -> float:
+    """Pick highest CVSS from CVE list, or fall back to port/service heuristic."""
+    scores = [c["cvss_score"] for c in cves if c.get("cvss_score") is not None]
+    if scores:
+        return max(scores)
+    return _heuristic_cvss(port, service)
+
+
+def _heuristic_cvss(port: int, service: str) -> float:
+    """Baseline CVSS when no CVE data is available."""
+    svc = (service or "unknown").lower()
+    table = {
+        "telnet": 9.8, "rsh": 9.8, "rlogin": 9.5,
+        "ftp": 7.5, "tftp": 7.0,
+        "smb": 9.0, "rdp": 8.8, "vnc": 8.5,
+        "redis": 8.0, "memcached": 7.8, "mongodb": 7.5,
+        "mysql": 7.2, "mssql": 7.2, "oracle": 7.2, "postgresql": 7.0,
+        "elasticsearch": 7.5, "etcd": 7.5,
+        "http": 6.1, "https": 5.5,
+        "ssh": 5.0, "smtp": 5.5, "dns": 5.3,
+        "snmp": 7.5, "ldap": 6.5,
+        "unknown": 4.0,
+    }
+    if svc in table:
+        return table[svc]
+    if port in {21, 23}:
+        return 9.0
+    if port in {3306, 5432, 1433, 1521}:
+        return 7.5
+    if port in {80, 8080}:
+        return 6.1
+    if port in {443, 8443}:
+        return 5.5
+    return 4.0
+
+
+def _cvss_to_severity(score: float) -> str:
+    if score >= 9.0: return "critical"
+    if score >= 7.0: return "high"
+    if score >= 4.0: return "medium"
+    return "low"
+
+
+def _has_exploit(script_text: str) -> bool:
+    text = script_text.lower()
+    return any(kw in text for kw in (
+        "exploit", "rce", "remote code execution",
+        "arbitrary command", "buffer overflow", "metasploit",
+        "proof of concept", "poc", "shellcode",
+    ))
+
+
+def _is_misconfigured(port: int, service: str, script_text: str) -> bool:
+    text = script_text.lower()
+    if port in OPEN_BY_DEFAULT and "anonymous" in text:
         return True
-    except Exception:
-        # allow simple hostname (letters, digits, hyphen, dot)
-        import re
-        if re.match(r'^[A-Za-z0-9\-\._]+$', target):
-            return True
-    
+    if "default credential" in text or "default password" in text:
+        return True
+    if port in AUTH_REQUIRED and "authentication: none" in text:
+        return True
+    if "misconfigur" in text or "insecure config" in text:
+        return True
     return False
 
 
-def _enqueue_stderr_line(line: str):
+def _estimate_patch_age(version_str: str) -> float:
     """
-    Non-blocking enqueue of stderr lines. If queue full, drop oldest to make room.
-    This function is safe to call from the stderr reader thread.
+    Very rough patch age estimate in years from version string.
+    Looks for 4-digit years; newer = 0, old = 5.
     """
+    import re
+    from datetime import datetime
+    years = re.findall(r'\b(20\d{2}|19\d{2})\b', version_str)
+    if years:
+        latest = max(int(y) for y in years)
+        age = datetime.utcnow().year - latest
+        return float(max(0, min(age, 10)))
+    return 2.0   # assume 2-year-old patch when unknown
+
+
+def _build_description(port, service, version, cves, exploit_found, misconfig) -> str:
+    parts = [f"Open port {port}/{service}"]
+    if version:
+        parts.append(f"version: {version}")
+    if exploit_found:
+        parts.append("⚠ Known exploit found in scan output")
+    if misconfig:
+        parts.append("⚠ Possible misconfiguration detected")
+    if cves:
+        top = cves[0]
+        parts.append(
+            f"Top CVE: {top['cve_id']} (CVSS {top.get('cvss_score', 'N/A')}) — "
+            f"{top.get('description', '')[:120]}"
+        )
+    return " | ".join(parts)
+
+
+def _update(scan, **kwargs):
+    for k, v in kwargs.items():
+        setattr(scan, k, v)
     try:
-        _stderr_queue.put_nowait(line)
-    except queue.Full:
-        try:
-            _stderr_queue.get_nowait()  # drop oldest
-        except Exception:
-            pass
-        try:
-            _stderr_queue.put_nowait(line)
-        except Exception:
-            # Last resort: drop the line silently
-            pass
-
-
-def _start_stderr_flusher(scan_id: int) -> threading.Thread:
-    """
-    Start a daemon flusher thread that consumes _stderr_queue and writes to DB.
-    Each flusher uses its own SQLAlchemy Session (sessionmaker bound to db.engine).
-    The flusher exits when it detects the Scan row status is completed/failed and the queue is drained.
-    """
-    Session = sessionmaker(bind=db.engine)
-    
-    def _flusher():
-        session = Session()
-        try:
-            while True:
-                try:
-                    line = _stderr_queue.get(timeout=1.0)
-                except queue.Empty:
-                    # If queue empty, check if scan finished; if so, exit loop.
-                    try:
-                        s = session.get(Scan, scan_id)
-                        if s is None or (s.status in ("completed", "failed") and _stderr_queue.empty()):
-                            break
-                        else:
-                            continue
-                    except Exception:
-                        # DB trouble: keep trying until queue drained and scan finished in main thread
-                        continue
-                
-                # persist the line safely (session local to this thread)
-                try:
-                    s = session.get(Scan, scan_id)
-                    if s:
-                        # append with timestamp; keep growth reasonable
-                        timestamp_line = f"[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {line}"
-                        if hasattr(s, 'log_data'):
-                            s.log_data = (s.log_data or "") + "\n" + timestamp_line
-                        if hasattr(s, 'log'):
-                            s.log = (s.log or "") + "\n" + timestamp_line
-                        try:
-                            session.commit()
-                        except Exception:
-                            try:
-                                session.rollback()
-                            except Exception:
-                                pass
-                except Exception:
-                    try:
-                        session.rollback()
-                    except Exception:
-                        pass
-                    # swallow errors and continue draining
-                    continue
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
-    
-    th = threading.Thread(target=_flusher, daemon=True)
-    th.start()
-    return th
-
-
-def run_scan(scan_id_or_target, target=None, mode: str = "fast", parse_xml: bool = True):
-    """
-    Orchestrator with real-time progress tracking.
-    - run_scan(scan_id, target, mode="fast", parse_xml=True) (app mode)
-    - run_scan("1.2.3.4", None, mode="fast", parse_xml=True) (legacy CLI)
-    
-    mode: "fast" | "medium" | "full"
-    parse_xml: whether to parse the XML and create VM/Vulnerability rows.
-    """
-    # detect legacy usage (if only target string provided)
-    if target is None and isinstance(scan_id_or_target, str):
-        real_target = scan_id_or_target
-        scan = None
-    else:
-        scan_id = int(scan_id_or_target) if scan_id_or_target is not None else None
-        real_target = target
-        scan = None
-    
-    # validate target early
-    if not validate_target(real_target):
-        raise ValueError(f"Invalid target: {real_target}")
-    
-    # try to get an app context (create_app) to bind DB if available
-    try:
-        from app import create_app
-        app, _ = create_app()
-        ctx = app.app_context()
-        ctx.push()
+        db.session.commit()
     except Exception:
-        app = None
-        ctx = None
-    
-    # fetch existing scan if provided
-    if 'scan_id' in locals() and scan_id is not None:
-        try:
-            scan = db.session.get(Scan, scan_id)
-        except Exception:
-            scan = None
-    
-    # create scan row if needed
-    if not scan:
-        try:
-            scan = Scan(
-                target=real_target,
-                status="running",
-                start_time=_dt.datetime.now(_dt.timezone.utc),
-                progress=0,
-                phase="initializing",
-                log="",
-                log_data="",
-                eta=""
-            )
-            db.session.add(scan)
-            db.session.commit()
-            scan_id = scan.id
-        except Exception:
-            try:
-                db.session.rollback()
-            except Exception:
-                pass
-            scan = None
-    
-    # Phase 0: Initializing (0%)
-    if scan:
-        emit_progress(scan.id, 0, 'initializing', 'Starting vulnerability scan...')
-    
-    # update initial scan row (set ETA hint as an ISO timestamp if possible)
-    if scan:
-        try:
-            db.session.refresh(scan)
-        except Exception:
-            pass
-        
-        scan.status = "running"
-        scan.start_time = _dt.datetime.now(_dt.timezone.utc)
-        scan.phase = "preparing"
-        
-        # compute initial ETA
-        per_host_secs = _MODE_ESTIMATE_SECONDS.get(mode, 120)
-        try:
-            scan.eta = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=per_host_secs)).isoformat()
-        except Exception:
-            scan.eta = ""
-        
-        try:
-            log_msg = f"Scan started (mode={mode}, target={real_target})"
-            if hasattr(scan, 'log_data'):
-                scan.log_data = (scan.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {log_msg}"
-            if hasattr(scan, 'log'):
-                scan.log = (scan.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {log_msg}"
-            db.session.commit()
-        except Exception:
-            try:
-                db.session.rollback()
-            except Exception:
-                pass
-    
-    # Phase 1: Preparing (5%)
-    if scan:
-        emit_progress(scan.id, 5, 'preparing', 'Preparing nmap command...', scan.eta)
-    
-    # build nmap command
-    cmd = build_nmap_cmd(real_target, mode=mode)
-    
-    # Phase 2: Port Scanning (10%)
-    if scan:
-        emit_progress(scan.id, 10, 'port_scanning', f'Scanning target {real_target}...', scan.eta)
-    
-    # Start flusher thread to safely accept stderr lines
-    flusher_thread = None
-    if scan:
-        flusher_thread = _start_stderr_flusher(scan.id)
-    
-    # Run nmap; pass enqueue function as stderr callback
-    rc, xml_out, stderr_tail = run_nmap_and_capture_xml(cmd, stderr_line_cb=_enqueue_stderr_line, timeout=None)
-    
-    # Phase 3: Analyzing (50%)
-    if scan:
-        emit_progress(scan.id, 50, 'analyzing', 'Analyzing scan results...')
-    
-    # After runner returns: final drain of queued stderr lines into DB
-    if scan:
-        try:
-            Session = sessionmaker(bind=db.engine)
-            session = Session()
-            try:
-                while not _stderr_queue.empty():
-                    try:
-                        line = _stderr_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    
-                    try:
-                        s = session.get(Scan, scan.id)
-                        if s:
-                            timestamp_line = f"[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {line}"
-                            if hasattr(s, 'log_data'):
-                                s.log_data = (s.log_data or "") + "\n" + timestamp_line
-                            if hasattr(s, 'log'):
-                                s.log = (s.log or "") + "\n" + timestamp_line
-                            try:
-                                session.commit()
-                            except Exception:
-                                try:
-                                    session.rollback()
-                                except Exception:
-                                    pass
-                    except Exception:
-                        try:
-                            session.rollback()
-                        except Exception:
-                            pass
-                        continue
-            finally:
-                try:
-                    session.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    
-    # store raw XML on Scan
-    if scan:
-        try:
-            s = db.session.get(Scan, scan.id) or scan
-            s.raw_output = xml_out
-            try:
-                db.session.commit()
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        except Exception:
-            try:
-                db.session.rollback()
-            except Exception:
-                pass
-    
-    # record nmap return code
-    if scan:
-        try:
-            s = db.session.get(Scan, scan.id) or scan
-            log_msg = f"nmap rc={rc}"
-            if hasattr(s, 'log_data'):
-                s.log_data = (s.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {log_msg}"
-            if hasattr(s, 'log'):
-                s.log = (s.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {log_msg}"
-            try:
-                db.session.commit()
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        except Exception:
-            try:
-                db.session.rollback()
-            except Exception:
-                pass
-    
-    # handle nmap failure
-    if rc != 0 and not xml_out:
-        if scan:
-            try:
-                s = db.session.get(Scan, scan.id) or scan
-                s.status = "failed"
-                s.phase = "nmap_failed"
-                s.progress = 100
-                error_msg = f"nmap failed: {stderr_tail}"
-                if hasattr(s, 'log_data'):
-                    s.log_data = (s.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {error_msg}"
-                if hasattr(s, 'log'):
-                    s.log = (s.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {error_msg}"
-                emit_progress(scan.id, 100, 'failed', error_msg)
-                try:
-                    db.session.commit()
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        
-        if ctx:
-            try:
-                ctx.pop()
-            except Exception:
-                pass
-        
-        if flusher_thread:
-            try:
-                flusher_thread.join(timeout=2)
-            except Exception:
-                pass
-        
-        return
-    
-    # Phase 4: Parsing (60%)
-    hosts: List[Dict[str, Any]] = []
-    if xml_out:
-        if scan:
-            emit_progress(scan.id, 60, 'parsing', 'Parsing XML results...')
-        
-        try:
-            hosts = parse_nmap_xml(xml_out)
-        except Exception as e:
-            if scan:
-                try:
-                    s = db.session.get(Scan, scan.id) or scan
-                    error_msg = f"XML parse error: {e}"
-                    if hasattr(s, 'log_data'):
-                        s.log_data = (s.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {error_msg}"
-                    if hasattr(s, 'log'):
-                        s.log = (s.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {error_msg}"
-                    try:
-                        db.session.commit()
-                    except Exception:
-                        try:
-                            db.session.rollback()
-                        except Exception:
-                            pass
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-            hosts = []
-    
-    # If parse_xml is False: minimal VM upsert then exit
-    if not parse_xml:
-        if hosts:
-            try:
-                from models import VM
-                for host in hosts:
-                    ip = host.get("ip") or host.get("hostname")
-                    if not ip:
-                        continue
-                    
-                    try:
-                        vm = VM.query.filter_by(ip_address=str(ip)).first()
-                    except Exception:
-                        try:
-                            vm = db.session.query(VM).filter_by(ip_address=str(ip)).first()
-                        except Exception:
-                            vm = None
-                    
-                    if not vm:
-                        vm = VM(ip_address=str(ip), hostname=host.get("hostname") or "Unknown")
-                        db.session.add(vm)
-                
-                try:
-                    db.session.commit()
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        
-        if scan:
-            try:
-                s = db.session.get(Scan, scan.id) or scan
-                s.status = "completed" if rc == 0 else "failed"
-                s.phase = "completed" if rc == 0 else s.phase
-                s.progress = 100
-                s.end_time = _dt.datetime.now(_dt.timezone.utc)
-                emit_progress(scan.id, 100, 'completed', 'Scan completed')
-                try:
-                    db.session.commit()
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        
-        if flusher_thread:
-            try:
-                flusher_thread.join(timeout=2)
-            except Exception:
-                pass
-        
-        if ctx:
-            try:
-                ctx.pop()
-            except Exception:
-                pass
-        
-        return
-    
-    # if no hosts found
-    if not hosts:
-        if scan:
-            try:
-                s = db.session.get(Scan, scan.id) or scan
-                s.status = "completed"
-                s.progress = 100
-                s.phase = "no_hosts"
-                msg = "No hosts found"
-                if hasattr(s, 'log_data'):
-                    s.log_data = (s.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {msg}"
-                if hasattr(s, 'log'):
-                    s.log = (s.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {msg}"
-                emit_progress(scan.id, 100, 'completed', msg)
-                try:
-                    db.session.commit()
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        
-        if flusher_thread:
-            try:
-                flusher_thread.join(timeout=2)
-            except Exception:
-                pass
-        
-        if ctx:
-            try:
-                ctx.pop()
-            except Exception:
-                pass
-        
-        return
-    
-    # Phase 5: Vulnerability Detection (70-85%)
-    if scan:
-        emit_progress(scan.id, 70, 'vulnerability_detection', f'Processing {len(hosts)} hosts...')
-    
-    total_hosts = max(1, len(hosts))
-    host_idx = 0
-    
-    for host in hosts:
-        host_idx += 1
-        if scan:
-            try:
-                s = db.session.get(Scan, scan.id) or scan
-                pct_est = 70 + int((host_idx / total_hosts) * 15)  # 70-85%
-                s.progress = pct_est
-                s.phase = "processing_host"
-                host_ip = host.get('ip', 'unknown')
-                msg = f"Processing host {host_ip}"
-                if hasattr(s, 'log_data'):
-                    s.log_data = (s.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {msg}"
-                if hasattr(s, 'log'):
-                    s.log = (s.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {msg}"
-                emit_progress(scan.id, pct_est, 'analyzing_vulnerabilities', msg)
-                
-                # update ETA
-                try:
-                    per_host = _MODE_ESTIMATE_SECONDS.get(mode, 120)
-                    remaining_hosts = max(0, total_hosts - host_idx)
-                    remaining_secs = remaining_hosts * per_host
-                    
-                    if remaining_secs > 0:
-                        eta_dt = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=remaining_secs)
-                        s.eta = eta_dt.isoformat()
-                    else:
-                        s.eta = ""
-                    
-                    db.session.commit()
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        
-        # collect parsed vulns for each port (ISO 27005 style risk, no CVEs)
-        parsed_vulns_for_port: Dict[int, List[Dict[str, Any]]] = {}
-
-        for p in host.get("ports", []):
-            scripts = p.get("scripts", {}) or {}
-            portnum = p.get("port")
-            if portnum is None:
-                continue
-
-            findings: List[Dict[str, Any]] = []
-
-            for sid, out in scripts.items():
-                # only consider non-empty script output
-                if not isinstance(out, str) or not out.strip():
-                    continue
-
-                likelihood, impact, risk_score = classify_risk_from_script(sid, out)
-
-                findings.append({
-                    "issue_id": sid,                          # Nmap script id
-                    "likelihood": likelihood,                 # "Low"/"Medium"/"High"
-                    "impact": impact,                         # "Low"/"Medium"/"High"
-                    "risk_score": risk_score,                 # 1-25
-                    "description": f"[{sid}] {out[:500]}",    # trim long text for DB
-                })
-
-            if findings:
-                parsed_vulns_for_port[int(portnum)] = findings
-
-        # write host + vulnerability rows
-        try:
-            write_host_and_vulns(scan, host, parsed_vulns_for_port)
-        except Exception as e:
-            if scan:
-                try:
-                    s = db.session.get(Scan, scan.id) or scan
-                    error_msg = f"writer error: {e}"
-                    if hasattr(s, 'log_data'):
-                        s.log_data = (s.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {error_msg}"
-                    if hasattr(s, 'log'):
-                        s.log = (s.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {error_msg}"
-                    try:
-                        db.session.commit()
-                    except Exception:
-                        try:
-                            db.session.rollback()
-                        except Exception:
-                            pass
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-        
-        if scan:
-            try:
-                s = db.session.get(Scan, scan.id) or scan
-                msg = f"Finished host {host_ip}"
-                if hasattr(s, 'log_data'):
-                    s.log_data = (s.log_data or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {msg}"
-                if hasattr(s, 'log'):
-                    s.log = (s.log or "") + f"\n[{_dt.datetime.now(_dt.timezone.utc).isoformat()}] {msg}"
-                try:
-                    db.session.commit()
-                except Exception:
-                    try:
-                        db.session.rollback()
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-    
-    # Phase 6: Finalizing (90%)
-    if scan:
-        emit_progress(scan.id, 90, 'finalizing', 'Saving final results...')
-    
-    # Phase 7: Complete (100%)
-    if scan:
-        try:
-            s = db.session.get(Scan, scan.id) or scan
-            s.status = "completed"
-            s.phase = "completed"
-            s.progress = 100
-            s.end_time = _dt.datetime.now(_dt.timezone.utc)
-            s.eta = ""
-            emit_progress(scan.id, 100, 'completed', 'Scan completed successfully')
-            try:
-                db.session.commit()
-            except Exception:
-                try:
-                    db.session.rollback()
-                except Exception:
-                    pass
-        except Exception:
-            try:
-                db.session.rollback()
-            except Exception:
-                pass
-    
-    # cleanup
-    if flusher_thread:
-        try:
-            flusher_thread.join(timeout=3)
-        except Exception:
-            pass
-    
-    if ctx:
-        try:
-            ctx.pop()
-        except Exception:
-            pass
-    
-    return
+        db.session.rollback()
 
 
-# -------------------------
-# CLI entrypoint
-# -------------------------
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Standalone scanner runner")
-    parser.add_argument("--target", required=True, help="Target IP or CIDR")
-    parser.add_argument("--mode", choices=["fast", "medium", "full"], default="fast",
-                        help="Scan mode: fast=top ports (-F), medium=top-1000, full=all ports (-p-)")
-    parser.add_argument("--scan_id", type=int, required=False, help="Optional existing scan_id (app mode)")
-    parser.add_argument("--no-parse", action="store_true", help="Save raw XML only; do not parse ports/vulns")
-    args = parser.parse_args()
-    
-    parse_flag = not args.no_parse
-    
-    # Call run_scan with consistent signature
-    if args.scan_id:
-        run_scan(args.scan_id, args.target, mode=args.mode, parse_xml=parse_flag)
-    else:
-        run_scan(args.target, None, mode=args.mode, parse_xml=parse_flag)
+def _finish(scan, status, progress, phase):
+    scan.status   = status
+    scan.progress = progress
+    scan.phase    = phase
+    scan.end_time = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 
-if __name__ == "__main__":
-    main()
+
+
+
+

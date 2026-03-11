@@ -1,158 +1,147 @@
-# api/vm_routes.py
-import logging
 from flask import Blueprint, jsonify, request
-from flask_jwt_extended import verify_jwt_in_request, get_jwt
-from functools import wraps
+import datetime
 
-logger = logging.getLogger("digital_twin_app.vms")
+from models import db, VM, Vulnerability
+
 vm_bp = Blueprint("vm", __name__)
 
 
-def role_required(roles):
-    if isinstance(roles, str):
-        allowed = [roles]
-    else:
-        allowed = list(roles)
+# ── GET /api/vms ── list all discovered assets ────────────────────────────────
+@vm_bp.route("/api/vms", methods=["GET"])
+def get_vms():
+    vms = VM.query.order_by(VM.id.desc()).all()
 
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            verify_jwt_in_request()
-            claims = get_jwt()
-            role = claims.get("role")
-            if role not in allowed:
-                return jsonify({"msg": "forbidden - insufficient role"}), 403
-            return fn(*args, **kwargs)
-        return wrapper
-    return decorator
+    result = []
+    for vm in vms:
+        # Count vulns per VM
+        vuln_counts = _vuln_counts(vm.id)
+        result.append({
+            "id":          vm.id,
+            "ip_address":  vm.ip_address,
+            "hostname":    vm.hostname or vm.ip_address,
+            "os":          vm.os or "Unknown",
+            "os_family":   vm.os_family or "Unknown",
+            "status":      vm.status or "active",
+            "risk_level":  vm.risk_level or "UNKNOWN",
+            "last_seen":   vm.last_seen.isoformat() if vm.last_seen else None,
+            "vuln_counts": vuln_counts,
+        })
 
-
-def _models():
-    from models import db, VM
-    return db, VM
-
-
-# List / Read
-@vm_bp.route("/vm", methods=["GET"])
-@vm_bp.route("/vms", methods=["GET"])
-@role_required(["Viewer", "Analyst", "Admin"])
-def list_vms():
-    try:
-        db, VM = _models()
-        vms = VM.query.all()
-        out = []
-        for v in vms:
-            out.append({
-                "id": v.id,
-                "ip": v.ip_address,        # Fixed: use ip_address
-                "name": v.hostname,        # Fixed: use hostname
-                "os": v.os or "Unknown",
-                "status": "active"         # Hardcoded or add to model
-            })
-        return jsonify({"vms": out}), 200
-    except Exception:
-        logger.exception("list_vms failed")
-        return jsonify({"error": "could not fetch VMs"}), 500
+    return jsonify({"vms": result, "total": len(result)})
 
 
-@vm_bp.route("/vm/<int:vm_id>", methods=["GET"])
-@role_required(["Viewer", "Analyst", "Admin"])
+# ── GET /api/vm/<id> ── single VM detail ──────────────────────────────────────
+@vm_bp.route("/api/vm/<int:vm_id>", methods=["GET"])
 def get_vm(vm_id):
-    try:
-        db, VM = _models()
-        v = VM.query.get(vm_id)
-        if not v:
-            return jsonify({"error": "VM not found"}), 404
-        return jsonify({
-            "id": v.id,
-            "ip": v.ip_address,
-            "name": v.hostname,
-            "os": v.os or "Unknown",
-            "status": "active"
-        }), 200
-    except Exception:
-        logger.exception("get_vm failed for id=%s", vm_id)
-        return jsonify({"error": "could not fetch VM"}), 500
+    vm = db.session.get(VM, vm_id)
+    if not vm:
+        return jsonify({"error": "VM not found"}), 404
+
+    vulns = Vulnerability.query.filter_by(vm_id=vm_id)\
+                .order_by(Vulnerability.risk_score.desc()).all()
+
+    return jsonify({
+        **vm.to_dict(),
+        "vuln_counts":    _vuln_counts(vm_id),
+        "vulnerabilities": [v.to_dict() for v in vulns],
+    })
 
 
-# Create
-@vm_bp.route("/vm", methods=["POST"])
-@role_required(["Analyst", "Admin"])
-def create_vm():
-    data = request.get_json() or {}
-    ip = data.get("ip")
-    name = data.get("name")
-    
-    if not ip:
-        return jsonify({"error": "ip is required"}), 400
-
-    try:
-        db, VM = _models()
-        new_vm = VM(
-            ip_address=ip,
-            hostname=name or "Unknown"
-        )
-        if "os" in data:
-            new_vm.os = data.get("os")
-        
-        db.session.add(new_vm)
-        db.session.commit()
-        return jsonify({"message": "vm created", "id": new_vm.id}), 201
-    except Exception:
-        logger.exception("create_vm failed with data=%s", data)
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
-        return jsonify({"error": "could not create VM"}), 500
-
-
-# Update
-@vm_bp.route("/vm/<int:vm_id>", methods=["PUT", "PATCH"])
-@role_required(["Analyst", "Admin"])
+# ── PATCH /api/vm/<id> ── update VM metadata ──────────────────────────────────
+@vm_bp.route("/api/vm/<int:vm_id>", methods=["PATCH"])
 def update_vm(vm_id):
-    data = request.get_json() or {}
-    try:
-        db, VM = _models()
-        v = VM.query.get(vm_id)
-        if not v:
-            return jsonify({"error": "VM not found"}), 404
-        
-        if "ip" in data:
-            v.ip_address = data.get("ip")
-        if "name" in data:
-            v.hostname = data.get("name")
-        if "os" in data:
-            v.os = data.get("os")
-        
-        db.session.commit()
-        return jsonify({"message": "vm updated"}), 200
-    except Exception:
-        logger.exception("update_vm failed for id=%s data=%s", vm_id, data)
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
-        return jsonify({"error": "could not update VM"}), 500
+    vm = db.session.get(VM, vm_id)
+    if not vm:
+        return jsonify({"error": "VM not found"}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+    allowed = ("hostname", "os", "os_family", "status")
+    for field in allowed:
+        if field in data:
+            setattr(vm, field, data[field])
+
+    db.session.commit()
+    return jsonify(vm.to_dict())
 
 
-# Delete
-@vm_bp.route("/vm/<int:vm_id>", methods=["DELETE"])
-@role_required(["Admin"])
+# ── DELETE /api/vm/<id> ── remove a VM ───────────────────────────────────────
+@vm_bp.route("/api/vm/<int:vm_id>", methods=["DELETE"])
 def delete_vm(vm_id):
-    try:
-        db, VM = _models()
-        v = VM.query.get(vm_id)
-        if not v:
-            return jsonify({"error": "VM not found"}), 404
-        
-        db.session.delete(v)
-        db.session.commit()
-        return jsonify({"message": "vm deleted"}), 200
-    except Exception:
-        logger.exception("delete_vm failed for id=%s", vm_id)
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
-        return jsonify({"error": "could not delete VM"}), 500
+    vm = db.session.get(VM, vm_id)
+    if not vm:
+        return jsonify({"error": "VM not found"}), 404
+    Vulnerability.query.filter_by(vm_id=vm_id).delete()
+    db.session.delete(vm)
+    db.session.commit()
+    return jsonify({"deleted": vm_id})
+
+
+# ── GET /api/vm/<id>/vulnerabilities ── all vulns for one VM ──────────────────
+@vm_bp.route("/api/vm/<int:vm_id>/vulnerabilities", methods=["GET"])
+def get_vm_vulnerabilities(vm_id):
+    vm = db.session.get(VM, vm_id)
+    if not vm:
+        return jsonify({"error": "VM not found"}), 404
+
+    severity_filter = request.args.get("severity")
+    status_filter   = request.args.get("status")
+
+    q = Vulnerability.query.filter_by(vm_id=vm_id)
+    if severity_filter:
+        q = q.filter_by(severity=severity_filter.lower())
+    if status_filter:
+        q = q.filter_by(remediation_status=status_filter)
+
+    vulns = q.order_by(Vulnerability.risk_score.desc()).all()
+    return jsonify({
+        "vm_id":           vm_id,
+        "total":           len(vulns),
+        "vulnerabilities": [v.to_dict() for v in vulns],
+    })
+
+
+# ── GET /api/assets/summary ── grouped severity overview ─────────────────────
+@vm_bp.route("/api/assets/summary", methods=["GET"])
+def assets_summary():
+    vms = VM.query.all()
+    summary = {
+        "total":    len(vms),
+        "critical": 0,
+        "high":     0,
+        "medium":   0,
+        "low":      0,
+        "clean":    0,
+    }
+    for vm in vms:
+        level = (vm.risk_level or "").upper()
+        if level in summary:
+            summary[level.lower()] += 1
+        else:
+            summary["clean"] += 1
+    return jsonify(summary)
+
+
+# ── Helper ────────────────────────────────────────────────────────────────────
+def _vuln_counts(vm_id: int) -> dict:
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "total": 0}
+    vulns = Vulnerability.query.filter_by(vm_id=vm_id).all()
+    for v in vulns:
+        sev = (v.severity or "low").lower()
+        if sev in counts:
+            counts[sev] += 1
+        counts["total"] += 1
+    return counts
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -3,11 +3,11 @@ from app import create_app
 from models import db, User, ROLE_ADMIN
 
 def create_admin(username="admin", password="admin123", email=None):
-    app = create_app()
+    app, socketio = create_app()
     with app.app_context():
         db.create_all()
         if User.query.filter_by(username=username).first():
-            print("User already exists")
+            print("User already essssxists")
             return
         u = User(username=username, email=email, role=ROLE_ADMIN)
         u.set_password(password)
