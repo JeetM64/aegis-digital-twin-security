@@ -1,20 +1,9 @@
-"""
-Real scanning pipeline:
-
-  1. nmap_runner   → run nmap with vuln scripts, capture XML
-  2. xml_parser    → parse hosts / ports / script output
-  3. cve_parser    → extract CVE ids from script output + NVD enrichment
-  4. risk_model    → ML probability for each port/service
-  5. prioritization→ composite score
-  6. DB write      → Vulnerability rows with full data
-"""
-
 import logging
 from datetime import datetime
 from typing import Optional
-
+ 
 from models import db, Scan, Vulnerability, VM
-
+ 
 from scanner.nmap_runner  import build_nmap_cmd, run_nmap_and_capture_xml
 from scanner.xml_parser   import parse_nmap_xml
 from scanner.cve_parser   import (
@@ -24,80 +13,70 @@ from scanner.cve_parser   import (
 )
 from ml.risk_model import predict_risk, SERVICE_RISK_MAP, INTERNET_PORTS
 from ai.prioritization import prioritize_vulnerabilities
-
+ 
 logger = logging.getLogger(__name__)
-
-# Ports where anonymous / open access is common (misconfig flag)
+ 
 OPEN_BY_DEFAULT = {21, 23, 25, 53, 80, 2379, 6379, 9200, 11211, 27017}
-
-# Services that should require auth – flag if they appear without it
-AUTH_REQUIRED = {3306, 5432, 1433, 1521, 27017, 6379, 9200, 2379, 11211}
-
-
+AUTH_REQUIRED   = {3306, 5432, 1433, 1521, 27017, 6379, 9200, 2379, 11211}
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 def run_scan(scan_id: int, target: str, mode: str = "fast"):
-    """
-    Entry point called from scan_routes.py in a background thread.
-    """
     scan = db.session.get(Scan, scan_id)
     if not scan:
         logger.error("Scan %s not found", scan_id)
         return
-
+ 
     try:
         _update(scan, status="running", phase="initialising", progress=2)
-
-        # ── Step 1: build + run nmap ──────────────────────────────────────────
+ 
         cmd = build_nmap_cmd(target, mode=mode)
         logger.info("[scan %s] nmap cmd: %s", scan_id, " ".join(cmd))
-
+ 
         _update(scan, phase="scanning", progress=10)
-
+ 
         timeout_map = {"fast": 300, "medium": 600, "deep": 1800}
         rc, xml_output, stderr = run_nmap_and_capture_xml(
             cmd,
             stderr_line_cb=lambda line: logger.debug("[nmap] %s", line),
             timeout=timeout_map.get(mode, 300),
         )
-
+ 
         if not xml_output:
             raise RuntimeError(
                 f"nmap returned no XML output (rc={rc}). stderr tail:\n{stderr[-500:]}"
             )
-
+ 
         _update(scan, phase="parsing results", progress=40)
-
-        # ── Step 2: parse XML ─────────────────────────────────────────────────
+ 
         hosts = parse_nmap_xml(xml_output)
         logger.info("[scan %s] parsed %d host(s)", scan_id, len(hosts))
-
+ 
         if not hosts:
             _finish(scan, status="completed", progress=100,
                     phase="completed – no hosts found")
             return
-
-        # ── Step 3–6: process each open port ─────────────────────────────────
+ 
         _update(scan, phase="analysing vulnerabilities", progress=55)
-
+ 
         total_ports = sum(
             1 for h in hosts
             for p in h.get("ports", [])
             if p.get("state") == "open"
         )
         processed = 0
-
+ 
         for host in hosts:
             ip       = host.get("ip", target)
             hostname = host.get("hostname") or ip
             os_name  = host.get("os") or "Unknown"
-
-            # Upsert VM record
+ 
             _upsert_vm(ip, hostname, os_name)
-
+ 
             for port_data in host.get("ports", []):
                 if port_data.get("state") != "open":
                     continue
-
+ 
                 try:
                     _process_port(scan_id, ip, port_data)
                 except Exception as e:
@@ -105,59 +84,47 @@ def run_scan(scan_id: int, target: str, mode: str = "fast"):
                         "[scan %s] port %s processing error: %s",
                         scan_id, port_data.get("port"), e,
                     )
-
+ 
                 processed += 1
                 progress = 55 + int((processed / max(total_ports, 1)) * 35)
                 _update(scan, progress=min(progress, 90))
-
-        # ── Step 7: final prioritization pass ────────────────────────────────
+ 
         _update(scan, phase="prioritising", progress=92)
         _reprioritize_scan(scan_id)
-
+ 
         _finish(scan, status="completed", progress=100, phase="completed")
         logger.info("[scan %s] finished successfully", scan_id)
-
+ 
     except Exception as e:
         logger.exception("[scan %s] fatal error: %s", scan_id, e)
         scan = db.session.get(Scan, scan_id)
         if scan:
             _finish(scan, status="failed",
                     phase=f"failed: {str(e)[:200]}", progress=scan.progress or 0)
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 def _process_port(scan_id: int, ip: str, port_data: dict):
-    """
-    Full analysis for one open port:
-      CVE extraction → NVD enrichment → ML risk → DB write.
-    """
     port        = int(port_data["port"])
     svc_info    = port_data.get("service", {})
     service     = svc_info.get("name", "unknown")
     version     = _build_version_string(svc_info)
     scripts     = port_data.get("scripts", {})
-
-    # ── CVE extraction from nmap script output ────────────────────────────────
+ 
     script_text = "\n".join(scripts.values())
     cves        = extract_cves_from_text(script_text)
-
-    # If scripts found CVEs, enrich them from NVD
+ 
     if cves:
         cves = enrich_cves(cves)
     else:
-        # No CVEs in script output → query NVD by service + version keyword
         cves = fetch_cves_for_service(service, version, max_results=3)
-
-    # Derive best CVSS from CVE list
-    cvss = _best_cvss(cves, port, service)
-
-    # ── Flags ─────────────────────────────────────────────────────────────────
+ 
+    cvss          = _best_cvss(cves, port, service)
     exploit_found = _has_exploit(script_text)
     misconfig     = _is_misconfigured(port, service, script_text)
     cve_count     = len(cves)
     cve_ids_str   = ",".join(c["cve_id"] for c in cves[:10])
-
-    # ── ML risk prediction ────────────────────────────────────────────────────
+ 
     ml_prob = predict_risk(
         port          = port,
         cvss          = cvss,
@@ -165,18 +132,32 @@ def _process_port(scan_id: int, ip: str, port_data: dict):
         cve_count     = cve_count,
         exploit_found = exploit_found,
         misconfig     = misconfig,
-        network_depth = 0,     # perimeter assumption; can be passed from caller
+        network_depth = 0,
         critical_asset= port in AUTH_REQUIRED,
         patch_age     = _estimate_patch_age(version),
     )
-    ai_risk_score = round(ml_prob * 20, 2)   # scale to 0-20 for DB
-
-    # ── Severity from CVSS ────────────────────────────────────────────────────
-    severity = _cvss_to_severity(cvss)
-
-    # ── Build description ─────────────────────────────────────────────────────
-    description = _build_description(port, service, version, cves, exploit_found, misconfig)
-
+    ai_risk_score = round(ml_prob * 20, 2)
+    severity      = _cvss_to_severity(cvss)
+    description   = _build_description(port, service, version, cves, exploit_found, misconfig)
+ 
+    # ── Deduplication — don't save same port+service twice for same scan ──────
+    existing = Vulnerability.query.filter_by(
+        scan_id = scan_id,
+        port    = port,
+        service = service,
+    ).first()
+ 
+    if existing:
+        existing.version     = version
+        existing.severity    = severity
+        existing.description = description
+        existing.cvss_score  = cvss
+        existing.risk_score  = ai_risk_score
+        existing.cve_ids     = cve_ids_str
+        existing.cve_count   = cve_count
+        db.session.commit()
+        return
+ 
     vuln = Vulnerability(
         scan_id     = scan_id,
         port        = port,
@@ -191,21 +172,17 @@ def _process_port(scan_id: int, ip: str, port_data: dict):
     )
     db.session.add(vuln)
     db.session.commit()
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _reprioritize_scan(scan_id: int):
-    """Re-run prioritization on all vulns of a scan and update risk_score."""
-    vulns = Vulnerability.query.filter_by(scan_id=scan_id).all()
+    vulns  = Vulnerability.query.filter_by(scan_id=scan_id).all()
     ranked = prioritize_vulnerabilities(vulns)
     for (v, score) in ranked:
         v.risk_score = round(score, 2)
     db.session.commit()
-
-
+ 
+ 
 def _upsert_vm(ip: str, hostname: str, os_name: str):
     try:
         vm = VM.query.filter_by(ip_address=ip).first()
@@ -219,8 +196,8 @@ def _upsert_vm(ip: str, hostname: str, os_name: str):
     except Exception as e:
         logger.warning("VM upsert failed for %s: %s", ip, e)
         db.session.rollback()
-
-
+ 
+ 
 def _build_version_string(svc_info: dict) -> str:
     parts = [
         svc_info.get("product", ""),
@@ -228,19 +205,17 @@ def _build_version_string(svc_info: dict) -> str:
         svc_info.get("extrainfo", ""),
     ]
     return " ".join(p for p in parts if p).strip()
-
-
+ 
+ 
 def _best_cvss(cves: list, port: int, service: str) -> float:
-    """Pick highest CVSS from CVE list, or fall back to port/service heuristic."""
     scores = [c["cvss_score"] for c in cves if c.get("cvss_score") is not None]
     if scores:
         return max(scores)
     return _heuristic_cvss(port, service)
-
-
+ 
+ 
 def _heuristic_cvss(port: int, service: str) -> float:
-    """Baseline CVSS when no CVE data is available."""
-    svc = (service or "unknown").lower()
+    svc   = (service or "unknown").lower()
     table = {
         "telnet": 9.8, "rsh": 9.8, "rlogin": 9.5,
         "ftp": 7.5, "tftp": 7.0,
@@ -255,24 +230,20 @@ def _heuristic_cvss(port: int, service: str) -> float:
     }
     if svc in table:
         return table[svc]
-    if port in {21, 23}:
-        return 9.0
-    if port in {3306, 5432, 1433, 1521}:
-        return 7.5
-    if port in {80, 8080}:
-        return 6.1
-    if port in {443, 8443}:
-        return 5.5
+    if port in {21, 23}:   return 9.0
+    if port in {3306, 5432, 1433, 1521}: return 7.5
+    if port in {80, 8080}: return 6.1
+    if port in {443, 8443}: return 5.5
     return 4.0
-
-
+ 
+ 
 def _cvss_to_severity(score: float) -> str:
     if score >= 9.0: return "critical"
     if score >= 7.0: return "high"
     if score >= 4.0: return "medium"
     return "low"
-
-
+ 
+ 
 def _has_exploit(script_text: str) -> bool:
     text = script_text.lower()
     return any(kw in text for kw in (
@@ -280,8 +251,8 @@ def _has_exploit(script_text: str) -> bool:
         "arbitrary command", "buffer overflow", "metasploit",
         "proof of concept", "poc", "shellcode",
     ))
-
-
+ 
+ 
 def _is_misconfigured(port: int, service: str, script_text: str) -> bool:
     text = script_text.lower()
     if port in OPEN_BY_DEFAULT and "anonymous" in text:
@@ -293,23 +264,18 @@ def _is_misconfigured(port: int, service: str, script_text: str) -> bool:
     if "misconfigur" in text or "insecure config" in text:
         return True
     return False
-
-
+ 
+ 
 def _estimate_patch_age(version_str: str) -> float:
-    """
-    Very rough patch age estimate in years from version string.
-    Looks for 4-digit years; newer = 0, old = 5.
-    """
     import re
-    from datetime import datetime
     years = re.findall(r'\b(20\d{2}|19\d{2})\b', version_str)
     if years:
         latest = max(int(y) for y in years)
-        age = datetime.utcnow().year - latest
+        age    = datetime.utcnow().year - latest
         return float(max(0, min(age, 10)))
-    return 2.0   # assume 2-year-old patch when unknown
-
-
+    return 2.0
+ 
+ 
 def _build_description(port, service, version, cves, exploit_found, misconfig) -> str:
     parts = [f"Open port {port}/{service}"]
     if version:
@@ -325,8 +291,8 @@ def _build_description(port, service, version, cves, exploit_found, misconfig) -
             f"{top.get('description', '')[:120]}"
         )
     return " | ".join(parts)
-
-
+ 
+ 
 def _update(scan, **kwargs):
     for k, v in kwargs.items():
         setattr(scan, k, v)
@@ -334,8 +300,8 @@ def _update(scan, **kwargs):
         db.session.commit()
     except Exception:
         db.session.rollback()
-
-
+ 
+ 
 def _finish(scan, status, progress, phase):
     scan.status   = status
     scan.progress = progress
@@ -345,9 +311,3 @@ def _finish(scan, status, progress, phase):
         db.session.commit()
     except Exception:
         db.session.rollback()
-
-
-
-
-
-
