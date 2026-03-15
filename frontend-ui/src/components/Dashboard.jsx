@@ -3,10 +3,10 @@ import { AuthContext } from "../context/AuthContext";
 import Sidebar from "./Sidebar";
 import api from "../services/api";
 import toast from "react-hot-toast";
-
+ 
 const styles = `
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@300;400;500;600&display=swap');
-
+ 
   @keyframes fadeInUp {
     from { opacity: 0; transform: translateY(20px); }
     to { opacity: 1; transform: translateY(0); }
@@ -16,10 +16,6 @@ const styles = `
     70% { box-shadow: 0 0 0 10px rgba(0,229,255,0); }
     100% { box-shadow: 0 0 0 0 rgba(0,229,255,0); }
   }
-  @keyframes scanline {
-    0% { background-position: 0 0; }
-    100% { background-position: 0 100px; }
-  }
   @keyframes shimmer {
     0% { background-position: -200% center; }
     100% { background-position: 200% center; }
@@ -27,6 +23,9 @@ const styles = `
   @keyframes countUp {
     from { opacity: 0; transform: scale(0.8); }
     to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
   }
   .dash-main {
     display: flex;
@@ -89,13 +88,6 @@ const styles = `
     transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
     animation: fadeInUp 0.5s ease backwards;
   }
-  .stat-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    border-radius: 14px 14px 0 0;
-  }
   .stat-card:hover {
     transform: translateY(-3px);
     border-color: rgba(0,229,255,0.25);
@@ -136,14 +128,6 @@ const styles = `
     position: relative;
     overflow: hidden;
   }
-  .panel::after {
-    content: '';
-    position: absolute;
-    top: -40px; right: -40px;
-    width: 120px; height: 120px;
-    background: radial-gradient(circle, rgba(0,229,255,0.06), transparent 70%);
-    pointer-events: none;
-  }
   .panel-title {
     color: #00e5ff;
     font-size: 14px;
@@ -182,11 +166,41 @@ const styles = `
     font-weight: 600;
     font-size: 14px;
     font-family: 'JetBrains Mono', monospace;
+    margin: 0 0 4px;
+  }
+  .vuln-meta {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 4px;
   }
   .vuln-cvss {
-    color: #90caf9;
-    font-size: 12px;
-    margin-top: 2px;
+    color: #ffa726;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+    background: rgba(255,167,38,0.1);
+    border: 1px solid rgba(255,167,38,0.2);
+    padding: 2px 7px;
+    border-radius: 4px;
+  }
+  .vuln-cve {
+    color: #64b5f6;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    background: rgba(100,181,246,0.08);
+    border: 1px solid rgba(100,181,246,0.15);
+    padding: 2px 7px;
+    border-radius: 4px;
+  }
+  .vuln-severity {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
   }
   .priority-badge {
     background: linear-gradient(135deg, rgba(255,107,107,0.2), rgba(255,107,107,0.1));
@@ -197,6 +211,7 @@ const styles = `
     font-family: 'JetBrains Mono', monospace;
     padding: 4px 10px;
     border-radius: 6px;
+    white-space: nowrap;
   }
   .risk-display {
     text-align: center;
@@ -230,9 +245,7 @@ const styles = `
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
-  .scans-table-wrap {
-    overflow: hidden;
-  }
+  .scans-table-wrap { overflow: hidden; }
   .scans-table {
     width: 100%;
     border-collapse: collapse;
@@ -247,12 +260,7 @@ const styles = `
     text-align: left;
     border-bottom: 1px solid rgba(0,229,255,0.1);
   }
-  .scans-table tbody tr {
-    transition: background 0.15s ease;
-  }
-  .scans-table tbody tr:hover {
-    background: rgba(0,229,255,0.04);
-  }
+  .scans-table tbody tr:hover { background: rgba(0,229,255,0.04); }
   .scans-table tbody tr td {
     padding: 13px 14px;
     font-size: 13px;
@@ -308,9 +316,6 @@ const styles = `
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
   .empty-state {
     color: #546e7a;
     font-size: 13px;
@@ -318,37 +323,42 @@ const styles = `
     padding: 24px 0;
   }
 `;
-
+ 
 function getRiskColor(level) {
-  if (level === "HIGH") return "#ff4d4d";
-  if (level === "MEDIUM") return "#ffa726";
+  if (level === "CRITICAL") return "#ff4d4d";
+  if (level === "HIGH")     return "#ff4d4d";
+  if (level === "MEDIUM")   return "#ffa726";
   return "#51cf66";
 }
-
+ 
+function getSeverityStyle(sev) {
+  const s = (sev || "").toLowerCase();
+  if (s === "critical") return { background: "rgba(255,77,77,0.15)",  border: "1px solid rgba(255,77,77,0.3)",  color: "#ff4d4d" };
+  if (s === "high")     return { background: "rgba(255,107,107,0.15)",border: "1px solid rgba(255,107,107,0.3)",color: "#ff6b6b" };
+  if (s === "medium")   return { background: "rgba(255,167,38,0.15)", border: "1px solid rgba(255,167,38,0.3)", color: "#ffa726" };
+  return                       { background: "rgba(81,207,102,0.15)", border: "1px solid rgba(81,207,102,0.3)", color: "#51cf66" };
+}
+ 
 function getRiskBadgeStyle(level) {
   const color = getRiskColor(level);
-  return {
-    background: `${color}22`,
-    border: `1px solid ${color}55`,
-    color,
-  };
+  return { background: `${color}22`, border: `1px solid ${color}55`, color };
 }
-
+ 
 export default function Dashboard() {
   const { user } = useContext(AuthContext);
-  const [summary, setSummary] = useState({});
+  const [summary, setSummary]       = useState({});
   const [recentScans, setRecentScans] = useState([]);
   const [networkRisk, setNetworkRisk] = useState({});
-  const [topVulns, setTopVulns] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [now, setNow] = useState(new Date());
-
+  const [topVulns, setTopVulns]     = useState([]);
+  const [loading, setLoading]       = useState(true);
+  const [now, setNow]               = useState(new Date());
+ 
   useEffect(() => {
     loadDashboard();
     const t = setInterval(() => setNow(new Date()), 60000);
     return () => clearInterval(t);
   }, []);
-
+ 
   const loadDashboard = async () => {
     try {
       const [summaryRes, scans, risk, top] = await Promise.all([
@@ -368,7 +378,7 @@ export default function Dashboard() {
       setLoading(false);
     }
   };
-
+ 
   if (loading) {
     return (
       <>
@@ -380,21 +390,21 @@ export default function Dashboard() {
       </>
     );
   }
-
+ 
   const statCards = [
-    { title: "Total Assets", value: summary.totalVMs, color: "#00e5ff", icon: "🖥", delay: "0s" },
-    { title: "Healthy Assets", value: summary.healthyVMs, color: "#51cf66", icon: "✅", delay: "0.1s" },
-    { title: "At Risk Assets", value: summary.atRiskVMs, color: "#ff6b6b", icon: "⚠️", delay: "0.2s" },
-    { title: "Network Risk", value: networkRisk.risk_level || "N/A", color: getRiskColor(networkRisk.risk_level), icon: "🌐", delay: "0.3s" },
+    { title: "Total Assets",   value: summary.totalVMs,   color: "#00e5ff", icon: "🖥",  delay: "0s"   },
+    { title: "Healthy Assets", value: summary.healthyVMs, color: "#51cf66", icon: "✅",  delay: "0.1s" },
+    { title: "At Risk Assets", value: summary.atRiskVMs,  color: "#ff6b6b", icon: "⚠️", delay: "0.2s" },
+    { title: "Network Risk",   value: networkRisk.risk_level || "N/A", color: getRiskColor(networkRisk.risk_level), icon: "🌐", delay: "0.3s" },
   ];
-
+ 
   return (
     <>
       <style>{styles}</style>
       <div className="dash-main">
         <Sidebar />
         <div className="dash-content">
-
+ 
           {/* Header */}
           <div className="dash-header">
             <div>
@@ -406,34 +416,26 @@ export default function Dashboard() {
               <div style={{ marginTop: 4 }}>{now.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })}</div>
             </div>
           </div>
-
+ 
           {/* Stats */}
           <div className="stats-grid">
             {statCards.map((c, i) => (
-              <div
-                key={i}
-                className="stat-card"
-                style={{ animationDelay: c.delay }}
-              >
-                <div
-                  className="stat-card"
-                  style={{
-                    position: "absolute", top: 0, left: 0, right: 0, height: 2,
-                    background: c.color, borderRadius: "14px 14px 0 0",
-                    padding: 0, margin: 0,
-                  }}
-                />
+              <div key={i} className="stat-card" style={{ animationDelay: c.delay }}>
+                <div style={{
+                  position: "absolute", top: 0, left: 0, right: 0, height: 2,
+                  background: c.color, borderRadius: "14px 14px 0 0",
+                }} />
                 <span className="stat-icon">{c.icon}</span>
                 <p className="stat-label">{c.title}</p>
                 <h2 className="stat-value" style={{ color: c.color }}>{c.value ?? 0}</h2>
               </div>
             ))}
           </div>
-
-          {/* AI Panels */}
+ 
+          {/* Panels */}
           <div className="panels-grid">
-
-            {/* Top Vulnerabilities */}
+ 
+            {/* Top Vulnerabilities — now shows CVE ID + CVSS */}
             <div className="panel">
               <h2 className="panel-title">AI Priority Vulnerabilities</h2>
               {topVulns.length === 0 ? (
@@ -443,14 +445,39 @@ export default function Dashboard() {
                   <div key={i} className="vuln-row">
                     <div>
                       <p className="vuln-service">{v.service}:{v.port}</p>
-                      <p className="vuln-cvss">CVSS {v.cvss}</p>
+                      <div className="vuln-meta">
+                        {/* CVSS Score */}
+                        {v.cvss_score && (
+                          <span className="vuln-cvss">
+                            CVSS {Number(v.cvss_score).toFixed(1)}
+                          </span>
+                        )}
+                        {/* Top CVE ID */}
+                        {v.top_cve && (
+                          <span className="vuln-cve">{v.top_cve}</span>
+                        )}
+                        {/* Severity badge */}
+                        {v.severity && (
+                          <span className="vuln-severity" style={getSeverityStyle(v.severity)}>
+                            {v.severity}
+                          </span>
+                        )}
+                        {/* CVE count if more than 1 */}
+                        {v.cve_count > 1 && (
+                          <span style={{ color: "#546e7a", fontSize: 11 }}>
+                            +{v.cve_count - 1} more CVEs
+                          </span>
+                        )}
+                      </div>
                     </div>
-                    <div className="priority-badge">P{v.priority_score}</div>
+                    <div className="priority-badge">
+                      P{Number(v.risk_score || 0).toFixed(0)}
+                    </div>
                   </div>
                 ))
               )}
             </div>
-
+ 
             {/* Network Risk */}
             <div className="panel">
               <h2 className="panel-title">Network Risk</h2>
@@ -470,9 +497,9 @@ export default function Dashboard() {
                 </div>
               </div>
             </div>
-
+ 
           </div>
-
+ 
           {/* Recent Scans */}
           <div className="panel">
             <h2 className="panel-title">Recent Scans</h2>
@@ -496,16 +523,11 @@ export default function Dashboard() {
                     recentScans.map((scan) => (
                       <tr key={scan.id}>
                         <td>{scan.target}</td>
-                        <td>
-                          <span className="status-pill">{scan.status}</span>
-                        </td>
+                        <td><span className="status-pill">{scan.status}</span></td>
                         <td>
                           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                             <div className="progress-bar-wrap">
-                              <div
-                                className="progress-bar-fill"
-                                style={{ width: `${scan.progress || 0}%` }}
-                              />
+                              <div className="progress-bar-fill" style={{ width: `${scan.progress || 0}%` }} />
                             </div>
                             <span style={{ color: "#64b5f6", fontSize: 12 }}>{scan.progress}%</span>
                           </div>
@@ -517,7 +539,7 @@ export default function Dashboard() {
               </table>
             </div>
           </div>
-
+ 
         </div>
       </div>
     </>

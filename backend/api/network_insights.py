@@ -13,7 +13,6 @@ def get_network_insights():
  
     total_hosts = VM.query.count()
  
-    # Deduplicate — get unique port+service combinations only
     vulns = (
         Vulnerability.query
         .distinct(Vulnerability.port, Vulnerability.service)
@@ -29,8 +28,7 @@ def get_network_insights():
             services[v.service] = services.get(v.service, 0) + 1
  
     top_services = sorted(services.items(), key=lambda x: x[1], reverse=True)[:5]
- 
-    risk_score = sum([(v.risk_score or 0) for v in vulns])
+    risk_score   = sum([(v.risk_score or 0) for v in vulns])
  
     return jsonify({
         "total_hosts": total_hosts,
@@ -58,7 +56,7 @@ def get_scans():
             "status": s.status,
             "progress": s.progress,
             "start_time": str(s.start_time) if s.start_time else None,
-            "end_time": str(s.end_time) if s.end_time else None,
+            "end_time":   str(s.end_time)   if s.end_time   else None,
         }
         for s in scans
     ])
@@ -89,7 +87,6 @@ def recent_scans():
 @insights_bp.route("/vulnerabilities/by-severity", methods=["GET"])
 def vulns_by_severity():
  
-    # Deduplicate — count unique port+service combinations only
     vulns = (
         Vulnerability.query
         .distinct(Vulnerability.port, Vulnerability.service)
@@ -103,28 +100,23 @@ def vulns_by_severity():
         if sev in severity:
             severity[sev] += 1
         else:
-            # Fallback to risk_score bucketing
             score = v.risk_score or 0
-            if score <= 5:
-                severity["low"] += 1
-            elif score <= 10:
-                severity["medium"] += 1
-            elif score <= 15:
-                severity["high"] += 1
-            else:
-                severity["critical"] += 1
+            if score <= 5:       severity["low"]      += 1
+            elif score <= 10:    severity["medium"]   += 1
+            elif score <= 15:    severity["high"]     += 1
+            else:                severity["critical"] += 1
  
     return jsonify(severity)
  
  
 # ----------------------------
 # TOP VULNERABILITIES (for dashboard)
+# Now includes real CVE IDs + CVSS scores
 # ----------------------------
 @insights_bp.route("/top-vulnerabilities", methods=["GET"])
 def top_vulnerabilities():
  
-    # Get unique vulnerabilities ordered by risk score — no duplicates
-    seen = set()
+    seen   = set()
     result = []
  
     vulns = (
@@ -138,17 +130,30 @@ def top_vulnerabilities():
         if key in seen:
             continue
         seen.add(key)
+ 
+        # Parse CVE IDs into a clean list
+        cve_list = []
+        if v.cve_ids:
+            cve_list = [c.strip() for c in v.cve_ids.split(",") if c.strip()]
+ 
+        # Pick first CVE to show on dashboard
+        top_cve = cve_list[0] if cve_list else None
+ 
         result.append({
-            "id": v.id,
-            "port": v.port,
-            "service": v.service,
-            "severity": v.severity,
-            "cvss_score": v.cvss_score,
-            "risk_score": v.risk_score,
-            "cve_ids": v.cve_ids,
-            "description": v.description,
+            "id":             v.id,
+            "port":           v.port,
+            "service":        v.service,
+            "severity":       v.severity,
+            "cvss_score":     v.cvss_score,
+            "risk_score":     v.risk_score,
+            "cve_ids":        v.cve_ids,
+            "cve_list":       cve_list,
+            "top_cve":        top_cve,
+            "cve_count":      v.cve_count or len(cve_list),
+            "description":    v.description,
         })
+ 
         if len(result) >= 10:
             break
  
-    return jsonify(result)
+    return jsonify({"top_vulnerabilities": result})
