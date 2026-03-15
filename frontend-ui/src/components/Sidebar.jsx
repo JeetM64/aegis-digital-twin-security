@@ -1,10 +1,10 @@
 import React, { useContext } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { AuthContext } from '../context/AuthContext';
-
+ 
 const styles = `
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@300;400;500;600&display=swap');
-
+ 
   @keyframes pulse-dot {
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.4; transform: scale(0.8); }
@@ -13,7 +13,7 @@ const styles = `
     from { opacity: 0; transform: translateX(-10px); }
     to { opacity: 1; transform: translateX(0); }
   }
-
+ 
   .sidebar {
     width: 240px;
     background: linear-gradient(180deg, #060f1a 0%, #0a1929 60%, #001429 100%);
@@ -26,7 +26,6 @@ const styles = `
     z-index: 1000;
     font-family: 'Inter', sans-serif;
   }
-
   .sidebar-logo {
     padding: 24px 20px;
     border-bottom: 1px solid rgba(0,229,255,0.1);
@@ -60,7 +59,6 @@ const styles = `
     text-transform: uppercase;
     margin: 2px 0 0;
   }
-
   .sidebar-status {
     margin: 12px 16px;
     padding: 8px 12px;
@@ -81,7 +79,6 @@ const styles = `
     animation: pulse-dot 2s infinite;
     flex-shrink: 0;
   }
-
   .sidebar-section-label {
     padding: 16px 20px 6px;
     font-size: 10px;
@@ -90,11 +87,9 @@ const styles = `
     text-transform: uppercase;
     color: rgba(100,181,246,0.4);
   }
-
   .sidebar-nav { flex: 1; padding: 8px 0; overflow-y: auto; }
   .sidebar-nav::-webkit-scrollbar { width: 3px; }
   .sidebar-nav::-webkit-scrollbar-thumb { background: rgba(0,229,255,0.2); border-radius: 2px; }
-
   .nav-item {
     padding: 11px 20px;
     margin: 2px 10px;
@@ -125,19 +120,6 @@ const styles = `
   }
   .nav-item.active .nav-label { color: #00e5ff; font-weight: 600; }
   .nav-item:hover .nav-label { color: #b0bec5; }
-
-  .nav-badge {
-    margin-left: auto;
-    background: rgba(255,107,107,0.2);
-    border: 1px solid rgba(255,107,107,0.3);
-    color: #ff6b6b;
-    font-size: 10px;
-    font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
-    padding: 2px 7px;
-    border-radius: 10px;
-  }
-
   .sidebar-footer {
     padding: 16px;
     border-top: 1px solid rgba(0,229,255,0.1);
@@ -180,36 +162,31 @@ const styles = `
   }
   .logout-btn:hover { color: #ff6b6b; }
 `;
-
+ 
 const menuItems = [
-  { icon: '⬡', label: 'Dashboard',       path: '/dashboard',       section: 'OVERVIEW' },
-  { icon: '◈', label: 'Asset Inventory', path: '/assets',          section: 'MONITOR' },
-  { icon: '◎', label: 'Scan Management', path: '/scans',           section: 'MONITOR' },
-  { icon: '◬', label: 'Vulnerabilities', path: '/vulnerabilities', section: 'MONITOR' },
-  { icon: '⊞', label: 'Reports Hub',     path: '/reports',         section: 'INTEL' },
-  { icon: '◧', label: 'Settings',        path: '/settings',        section: 'INTEL' },
+  { icon: '⬡',  label: 'Dashboard',        path: '/dashboard',       section: 'OVERVIEW' },
+  { icon: '◈',  label: 'Asset Inventory',  path: '/assets',          section: 'MONITOR'  },
+  { icon: '◎',  label: 'Scan Management',  path: '/scans',           section: 'MONITOR'  },
+  { icon: '◬',  label: 'Vulnerabilities',  path: '/vulnerabilities', section: 'MONITOR'  },
+  { icon: '🌐', label: 'Network Topology', path: '/topology',        section: 'MONITOR'  },
+  { icon: '⊞',  label: 'Reports Hub',      path: '/reports',         section: 'INTEL'    },
+  { icon: '◧',  label: 'Settings',         path: '/settings',        section: 'INTEL'    },
 ];
-
+ 
 export default function Sidebar() {
-  const navigate  = useNavigate();
-  const location  = useLocation();
+  const navigate = useNavigate();
+  const location = useLocation();
   const { user, logout } = useContext(AuthContext);
-
+ 
   const isActive = (path) => location.pathname === path;
-
-  // Group items by section
   const sections = [...new Set(menuItems.map(i => i.section))];
-
-  const initials = (user?.username || 'AD')
-    .slice(0, 2)
-    .toUpperCase();
-
+  const initials = (user?.username || 'AD').slice(0, 2).toUpperCase();
+ 
   return (
     <>
       <style>{styles}</style>
       <div className="sidebar">
-
-        {/* Logo */}
+ 
         <div className="sidebar-logo">
           <div className="logo-icon">🛡️</div>
           <div>
@@ -217,14 +194,12 @@ export default function Sidebar() {
             <p className="logo-sub">Digital Twin Security</p>
           </div>
         </div>
-
-        {/* System status */}
+ 
         <div className="sidebar-status">
           <span className="status-dot" />
           ALL SYSTEMS OPERATIONAL
         </div>
-
-        {/* Nav */}
+ 
         <nav className="sidebar-nav">
           {sections.map((section, si) => (
             <div key={section}>
@@ -245,8 +220,7 @@ export default function Sidebar() {
             </div>
           ))}
         </nav>
-
-        {/* Footer */}
+ 
         <div className="sidebar-footer">
           <div className="user-card">
             <div className="user-avatar">{initials}</div>
@@ -254,14 +228,10 @@ export default function Sidebar() {
               <p className="user-name">{user?.username || 'Admin'}</p>
               <p className="user-role">{user?.role || 'Administrator'}</p>
             </div>
-            <button
-              className="logout-btn"
-              title="Logout"
-              onClick={logout}
-            >⏻</button>
+            <button className="logout-btn" title="Logout" onClick={logout}>⏻</button>
           </div>
         </div>
-
+ 
       </div>
     </>
   );
