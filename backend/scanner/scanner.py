@@ -66,12 +66,16 @@ def run_scan(scan_id: int, target: str, mode: str = "fast"):
         )
         processed = 0
  
+        # Track IPs found in this scan to update VM risk after
+        scanned_ips = []
+ 
         for host in hosts:
             ip       = host.get("ip", target)
             hostname = host.get("hostname") or ip
             os_name  = host.get("os") or "Unknown"
  
             _upsert_vm(ip, hostname, os_name)
+            scanned_ips.append(ip)
  
             for port_data in host.get("ports", []):
                 if port_data.get("state") != "open":
@@ -91,6 +95,12 @@ def run_scan(scan_id: int, target: str, mode: str = "fast"):
  
         _update(scan, phase="prioritising", progress=92)
         _reprioritize_scan(scan_id)
+ 
+        # ── Update VM risk_level based on scan results ────────────────────────
+        _update_vm_risk_levels(scanned_ips, scan_id)
+ 
+        # ── Update scan summary counts ────────────────────────────────────────
+        _update_scan_counts(scan, scan_id)
  
         _finish(scan, status="completed", progress=100, phase="completed")
         logger.info("[scan %s] finished successfully", scan_id)
@@ -140,7 +150,7 @@ def _process_port(scan_id: int, ip: str, port_data: dict):
     severity      = _cvss_to_severity(cvss)
     description   = _build_description(port, service, version, cves, exploit_found, misconfig)
  
-    # ── Deduplication — don't save same port+service twice for same scan ──────
+    # ── Deduplication ────────────────────────────────────────────────────────
     existing = Vulnerability.query.filter_by(
         scan_id = scan_id,
         port    = port,
@@ -181,6 +191,51 @@ def _reprioritize_scan(scan_id: int):
     for (v, score) in ranked:
         v.risk_score = round(score, 2)
     db.session.commit()
+ 
+ 
+def _update_vm_risk_levels(ips: list, scan_id: int):
+    """
+    After scan completes, calculate and set risk_level on each VM
+    based on the worst vulnerability severity found.
+    """
+    for ip in ips:
+        vm = VM.query.filter_by(ip_address=ip).first()
+        if not vm:
+            continue
+ 
+        # Get all vulns for this scan
+        vulns = Vulnerability.query.filter_by(scan_id=scan_id).all()
+ 
+        if not vulns:
+            vm.risk_level = "LOW"
+        else:
+            severities = [v.severity for v in vulns if v.severity]
+            if "critical" in severities:
+                vm.risk_level = "CRITICAL"
+            elif "high" in severities:
+                vm.risk_level = "HIGH"
+            elif "medium" in severities:
+                vm.risk_level = "MEDIUM"
+            else:
+                vm.risk_level = "LOW"
+ 
+        try:
+            db.session.commit()
+        except Exception as e:
+            logger.warning("VM risk_level update failed for %s: %s", ip, e)
+            db.session.rollback()
+ 
+ 
+def _update_scan_counts(scan, scan_id: int):
+    """Update summary counts on the scan record."""
+    vulns = Vulnerability.query.filter_by(scan_id=scan_id).all()
+    scan.total_vulns    = len(vulns)
+    scan.critical_count = sum(1 for v in vulns if v.severity == "critical")
+    scan.high_count     = sum(1 for v in vulns if v.severity == "high")
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
  
  
 def _upsert_vm(ip: str, hostname: str, os_name: str):
@@ -230,10 +285,10 @@ def _heuristic_cvss(port: int, service: str) -> float:
     }
     if svc in table:
         return table[svc]
-    if port in {21, 23}:   return 9.0
+    if port in {21, 23}:             return 9.0
     if port in {3306, 5432, 1433, 1521}: return 7.5
-    if port in {80, 8080}: return 6.1
-    if port in {443, 8443}: return 5.5
+    if port in {80, 8080}:           return 6.1
+    if port in {443, 8443}:          return 5.5
     return 4.0
  
  

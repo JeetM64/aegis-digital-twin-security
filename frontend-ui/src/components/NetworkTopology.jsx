@@ -282,7 +282,7 @@ function layoutNodes(vms) {
   // Place VMs in a circle
   vms.forEach((vm, i) => {
     const angle = (2 * Math.PI * i) / Math.max(vms.length, 1) - Math.PI / 2;
-    const radius = vms.length === 1 ? 0 : r;
+    const radius = r;
     nodes.push({
       id: `vm-${vm.id}`,
       label: vm.ip_address,

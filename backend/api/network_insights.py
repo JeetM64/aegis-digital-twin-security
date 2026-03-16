@@ -116,44 +116,48 @@ def vulns_by_severity():
 @insights_bp.route("/top-vulnerabilities", methods=["GET"])
 def top_vulnerabilities():
  
-    seen   = set()
-    result = []
- 
+    # Get ALL vulns ordered by risk score descending
     vulns = (
         Vulnerability.query
         .order_by(Vulnerability.risk_score.desc())
         .all()
     )
  
+    # Deduplicate — keep only the HIGHEST risk score per port+service combination
+    # This prevents same service from multiple scans showing multiple times
+    best = {}
     for v in vulns:
-        key = (v.port, v.service)
-        if key in seen:
-            continue
-        seen.add(key)
+        key = (v.port, (v.service or '').lower())
+        if key not in best:
+            best[key] = v
+        else:
+            # Keep whichever has higher risk score
+            if (v.risk_score or 0) > (best[key].risk_score or 0):
+                best[key] = v
  
-        # Parse CVE IDs into a clean list
+    # Sort by risk score and take top 10
+    sorted_vulns = sorted(best.values(), key=lambda v: v.risk_score or 0, reverse=True)[:10]
+ 
+    result = []
+    for v in sorted_vulns:
         cve_list = []
         if v.cve_ids:
             cve_list = [c.strip() for c in v.cve_ids.split(",") if c.strip()]
  
-        # Pick first CVE to show on dashboard
         top_cve = cve_list[0] if cve_list else None
  
         result.append({
-            "id":             v.id,
-            "port":           v.port,
-            "service":        v.service,
-            "severity":       v.severity,
-            "cvss_score":     v.cvss_score,
-            "risk_score":     v.risk_score,
-            "cve_ids":        v.cve_ids,
-            "cve_list":       cve_list,
-            "top_cve":        top_cve,
-            "cve_count":      v.cve_count or len(cve_list),
-            "description":    v.description,
+            "id":          v.id,
+            "port":        v.port,
+            "service":     v.service,
+            "severity":    v.severity,
+            "cvss_score":  v.cvss_score,
+            "risk_score":  v.risk_score,
+            "cve_ids":     v.cve_ids,
+            "cve_list":    cve_list,
+            "top_cve":     top_cve,
+            "cve_count":   v.cve_count or len(cve_list),
+            "description": v.description,
         })
- 
-        if len(result) >= 10:
-            break
  
     return jsonify({"top_vulnerabilities": result})
