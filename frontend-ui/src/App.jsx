@@ -11,6 +11,7 @@ const Reports         = React.lazy(() => import('./components/Reports'));
 const Settings        = React.lazy(() => import('./components/Settings'));
 const NetworkTopology = React.lazy(() => import('./components/NetworkTopology'));
 const AttackPath      = React.lazy(() => import('./components/AttackPath'));
+const Compliance      = React.lazy(() => import('./components/Compliance'));
 
 function LoadingScreen() {
   return (
@@ -88,6 +89,10 @@ function AppRoutes() {
 
         <Route path="/attack-path" element={
           <ProtectedRoute><AttackPath /></ProtectedRoute>
+        } />
+
+        <Route path="/compliance" element={
+          <ProtectedRoute><Compliance /></ProtectedRoute>
         } />
 
         <Route path="/" element={<Navigate to="/dashboard" replace />} />

@@ -111,6 +111,19 @@ def create_app():
             "total_assets":          len(assets),
         })
 
+    # ── Compliance Check ─────────────────────────────────────────────────────────
+    @app.route("/api/compliance")
+    def compliance_check():
+        try:
+            from ai.compliance import run_compliance_check
+            vulns = Vulnerability.query.all()
+            scans = Scan.query.filter_by(status="completed").all()
+            result = run_compliance_check(vulns, scans)
+            return jsonify(result)
+        except Exception as e:
+            logger.error("Compliance check error: %s", e)
+            return jsonify({"score": 0, "overall_status": "ERROR", "error": str(e)}), 200
+
     # ── Attack Path Simulation ───────────────────────────────────────────────────
     @app.route("/api/attack-paths")
     def attack_paths():

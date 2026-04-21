@@ -124,6 +124,16 @@ const styles = `
     padding: 2px 6px; border-radius: 8px;
     letter-spacing: 0.04em;
   }
+  .nav-badge-green {
+    margin-left: auto;
+    background: rgba(81,207,102,0.15);
+    border: 1px solid rgba(81,207,102,0.3);
+    color: #51cf66;
+    font-size: 9px; font-weight: 700;
+    font-family: 'JetBrains Mono', monospace;
+    padding: 2px 6px; border-radius: 8px;
+    letter-spacing: 0.04em;
+  }
   .sidebar-footer {
     padding: 16px;
     border-top: 1px solid rgba(0,229,255,0.1);
@@ -161,6 +171,7 @@ const menuItems = [
   { icon: '🌐', label: 'Network Topology',    path: '/topology',        section: 'MONITOR',  danger: false },
   { icon: '⚔',  label: 'Attack Path Sim',     path: '/attack-path',     section: 'MONITOR',  danger: true, badge: 'AI' },
   { icon: '⊞',  label: 'Reports Hub',         path: '/reports',         section: 'INTEL',    danger: false },
+  { icon: '✅', label: 'Compliance',          path: '/compliance',      section: 'INTEL',    danger: false, badge: 'NEW' },
   { icon: '◧',  label: 'Settings',            path: '/settings',        section: 'INTEL',    danger: false },
 ];
 
@@ -206,7 +217,11 @@ export default function Sidebar() {
                   >
                     <span className="nav-icon">{item.icon}</span>
                     <span className="nav-label">{item.label}</span>
-                    {item.badge && <span className="nav-badge">{item.badge}</span>}
+                    {item.badge && (
+                      <span className={item.badge === 'NEW' ? 'nav-badge-green' : 'nav-badge'}>
+                        {item.badge}
+                      </span>
+                    )}
                   </div>
                 ))}
             </div>
