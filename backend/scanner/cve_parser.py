@@ -1,11 +1,11 @@
-# cve_parser.py
 """
-CVE extraction + NVD API enrichment.
+cve_parser.py  –  CVE extraction + NVD API enrichment (Improved)
 
-Flow:
-  1. extract_cves_from_text()  – parse CVE-XXXX-XXXXX ids + inline CVSS from nmap script output
-  2. enrich_cves()             – hit NVD 2.0 API for real CVSS v3 scores + descriptions
-  3. fetch_cves_for_service()  – convenience: query NVD by keyword (service + version)
+Improvements:
+  1. Retry with exponential backoff on HTTP 429 / 5xx
+  2. Respects NVD Retry-After header
+  3. Configurable MAX_RETRIES and base RETRY_DELAY
+  4. Better logging — distinguishes rate-limit vs real failures
 """
 
 import re
@@ -16,29 +16,23 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Regex patterns ─────────────────────────────────────────────────────────────
 CVE_RE   = re.compile(r'(CVE-\d{4}-\d{4,7})', re.IGNORECASE)
 CVSS_RE  = re.compile(r'cvss(?:v\d)?[\s:=v]*([0-9]{1,2}\.[0-9])', re.IGNORECASE)
-SCORE_RE = re.compile(r'\b([0-9]\.[0-9]|10\.0)\b')   # fallback generic float
+SCORE_RE = re.compile(r'\b([0-9]\.[0-9]|10\.0)\b')
 
-# NVD API v2 base
-NVD_API  = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-NVD_TIMEOUT = 10   # seconds per request
-NVD_DELAY   = 0.7  # be polite – NVD rate limit is ~5 req/s without key
+NVD_API       = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_TIMEOUT   = 10
+NVD_DELAY     = 0.7
+MAX_RETRIES   = 3
+RETRY_BACKOFF = 2.0
 
 
-# ── 1. Extract CVEs from raw nmap script text ──────────────────────────────────
 def extract_cves_from_text(text: str) -> List[Dict]:
-    """
-    Parse CVE ids + inline CVSS scores from nmap --script vuln output.
-    Returns: [{'cve_id': str, 'cvss_score': float|None, 'description': str}]
-    Deduplicates by CVE id (keeps first occurrence).
-    """
     if not text:
         return []
 
     results: List[Dict] = []
-    seen:    set         = set()
+    seen: set = set()
 
     for line in text.splitlines():
         line = line.strip()
@@ -55,7 +49,6 @@ def extract_cves_from_text(text: str) -> List[Dict]:
                 continue
             seen.add(cve_id)
 
-            # Try CVSS label first, then generic float
             cvss: Optional[float] = None
             m = CVSS_RE.search(line)
             if m:
@@ -82,14 +75,7 @@ def extract_cves_from_text(text: str) -> List[Dict]:
     return results
 
 
-# ── 2. Enrich a list of CVE dicts using NVD API ────────────────────────────────
 def enrich_cves(cve_list: List[Dict]) -> List[Dict]:
-    """
-    For each entry in cve_list, fetch real CVSS v3 score + official description
-    from the NVD 2.0 API.  Falls back to the inline score when NVD is unavailable.
-
-    Mutates and returns the same list.
-    """
     for entry in cve_list:
         cve_id = entry.get('cve_id', '')
         if not cve_id:
@@ -104,7 +90,7 @@ def enrich_cves(cve_list: List[Dict]) -> List[Dict]:
             else:
                 entry['severity'] = _cvss_to_severity(entry.get('cvss_score'))
         except Exception as e:
-            logger.debug(f"NVD enrich failed for {cve_id}: {e}")
+            logger.debug("NVD enrich failed for %s: %s", cve_id, e)
             entry['severity'] = _cvss_to_severity(entry.get('cvss_score'))
 
         time.sleep(NVD_DELAY)
@@ -112,12 +98,7 @@ def enrich_cves(cve_list: List[Dict]) -> List[Dict]:
     return cve_list
 
 
-# ── 3. Fetch CVEs by service keyword (for ports with no script output) ─────────
 def fetch_cves_for_service(service: str, version: str = "", max_results: int = 5) -> List[Dict]:
-    """
-    Query NVD for CVEs matching <service> (+ optional version).
-    Returns list of {'cve_id', 'cvss_score', 'severity', 'description'}.
-    """
     keyword = f"{service} {version}".strip()
     if not keyword:
         return []
@@ -128,9 +109,11 @@ def fetch_cves_for_service(service: str, version: str = "", max_results: int = 5
         "startIndex": 0,
     }
 
+    resp = _nvd_get(NVD_API, params)
+    if resp is None:
+        return []
+
     try:
-        resp = requests.get(NVD_API, params=params, timeout=NVD_TIMEOUT)
-        resp.raise_for_status()
         items = resp.json().get("vulnerabilities", [])
         results = []
         for item in items:
@@ -146,20 +129,64 @@ def fetch_cves_for_service(service: str, version: str = "", max_results: int = 5
             })
         return results
     except Exception as e:
-        logger.debug(f"NVD service search failed for '{keyword}': {e}")
+        logger.debug("NVD service search parse error for '%s': %s", keyword, e)
         return []
 
 
-# ── Internal helpers ────────────────────────────────────────────────────────────
+def _nvd_get(url: str, params: dict) -> Optional[requests.Response]:
+    delay = NVD_DELAY
+    for attempt in range(1, MAX_RETRIES + 2):
+        try:
+            resp = requests.get(url, params=params, timeout=NVD_TIMEOUT)
+
+            if resp.status_code == 200:
+                return resp
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", delay))
+                wait = max(retry_after, delay)
+                logger.warning(
+                    "NVD rate-limited (429). Waiting %.1fs before retry %d/%d …",
+                    wait, attempt, MAX_RETRIES
+                )
+                time.sleep(wait)
+                delay *= RETRY_BACKOFF
+                continue
+
+            if resp.status_code >= 500:
+                logger.warning(
+                    "NVD server error %d. Retry %d/%d in %.1fs …",
+                    resp.status_code, attempt, MAX_RETRIES, delay
+                )
+                time.sleep(delay)
+                delay *= RETRY_BACKOFF
+                continue
+
+            logger.debug("NVD returned %d for %s", resp.status_code, params)
+            return None
+
+        except requests.Timeout:
+            logger.warning("NVD request timed out. Retry %d/%d in %.1fs …", attempt, MAX_RETRIES, delay)
+            time.sleep(delay)
+            delay *= RETRY_BACKOFF
+
+        except requests.ConnectionError as e:
+            logger.warning("NVD connection error: %s. Retry %d/%d in %.1fs …", e, attempt, MAX_RETRIES, delay)
+            time.sleep(delay)
+            delay *= RETRY_BACKOFF
+
+        if attempt > MAX_RETRIES:
+            break
+
+    logger.warning("NVD request failed after %d retries: %s", MAX_RETRIES, params)
+    return None
+
+
 def _nvd_lookup(cve_id: str) -> Optional[Dict]:
-    """Fetch a single CVE from NVD.  Returns None on failure."""
+    resp = _nvd_get(NVD_API, {"cveId": cve_id})
+    if resp is None:
+        return None
     try:
-        resp = requests.get(
-            NVD_API,
-            params={"cveId": cve_id},
-            timeout=NVD_TIMEOUT,
-        )
-        resp.raise_for_status()
         vulns = resp.json().get("vulnerabilities", [])
         if not vulns:
             return None
@@ -171,12 +198,11 @@ def _nvd_lookup(cve_id: str) -> Optional[Dict]:
             "references":  _extract_references(cve_data),
         }
     except Exception as e:
-        logger.debug(f"NVD lookup error for {cve_id}: {e}")
+        logger.debug("NVD parse error for %s: %s", cve_id, e)
         return None
 
 
 def _extract_cvss_from_nvd(cve_data: Dict) -> Optional[float]:
-    """Pull the best available CVSS score (v3.1 > v3.0 > v2) from NVD data."""
     metrics = cve_data.get("metrics", {})
     for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
         entries = metrics.get(key, [])
@@ -222,17 +248,3 @@ def _cvss_to_severity(score: Optional[float]) -> str:
     if score >= 4.0:
         return "MEDIUM"
     return "LOW"
-
-
-
-
-
-
-
-
-
-
-
-
-
-

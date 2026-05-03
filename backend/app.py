@@ -68,19 +68,47 @@ def create_app():
     def summary():
         total_vms = VM.query.count()
 
+        # FIX: query ALL vulns, not just top 10
+        # Use case-insensitive severity matching
         at_risk_ids = (
             db.session.query(Vulnerability.vm_id)
-            .filter(Vulnerability.severity.in_(["critical", "high"]))
+            .filter(
+                db.func.lower(Vulnerability.severity).in_(["critical", "high"])
+            )
             .filter(Vulnerability.vm_id.isnot(None))
             .distinct()
             .subquery()
         )
         at_risk = db.session.query(at_risk_ids).count()
 
-        total_vulns    = Vulnerability.query.count()
-        critical_vulns = Vulnerability.query.filter_by(severity="critical").count()
-        high_vulns     = Vulnerability.query.filter_by(severity="high").count()
-        exploitable    = Vulnerability.query.filter_by(exploit_available=True).count()
+        # FIX: count ALL vulns with case-insensitive severity
+        total_vulns = Vulnerability.query.count()
+
+        critical_vulns = Vulnerability.query.filter(
+            db.func.lower(Vulnerability.severity) == "critical"
+        ).count()
+
+        high_vulns = Vulnerability.query.filter(
+            db.func.lower(Vulnerability.severity) == "high"
+        ).count()
+
+        medium_vulns = Vulnerability.query.filter(
+            db.func.lower(Vulnerability.severity) == "medium"
+        ).count()
+
+        low_vulns = Vulnerability.query.filter(
+            db.func.lower(Vulnerability.severity) == "low"
+        ).count()
+
+        exploitable = Vulnerability.query.filter_by(exploit_available=True).count()
+
+        # Latest completed scan info
+        latest_scan = (
+            Scan.query
+            .filter_by(status="completed")
+            .order_by(Scan.id.desc())
+            .first()
+        )
 
         return jsonify({
             "totalVMs":      total_vms,
@@ -89,7 +117,11 @@ def create_app():
             "totalVulns":    total_vulns,
             "criticalVulns": critical_vulns,
             "highVulns":     high_vulns,
+            "mediumVulns":   medium_vulns,
+            "lowVulns":      low_vulns,
             "exploitable":   exploitable,
+            "latestScanId":  latest_scan.id if latest_scan else None,
+            "latestScanTarget": latest_scan.target if latest_scan else None,
         })
 
     # ── Network risk score ───────────────────────────────────────────────────────
@@ -100,15 +132,26 @@ def create_app():
         assets = VM.query.all()
         score  = calculate_network_risk(vulns, assets)
 
-        if score >= 70:   level = "HIGH"
-        elif score >= 40: level = "MEDIUM"
+        if score >= 75:   level = "CRITICAL"
+        elif score >= 50: level = "HIGH"
+        elif score >= 25: level = "MEDIUM"
         else:             level = "LOW"
+
+        # Severity breakdown for gauge context
+        critical = Vulnerability.query.filter(
+            db.func.lower(Vulnerability.severity) == "critical"
+        ).count()
+        high = Vulnerability.query.filter(
+            db.func.lower(Vulnerability.severity) == "high"
+        ).count()
 
         return jsonify({
             "network_risk_score":    round(score, 1),
             "risk_level":            level,
             "total_vulnerabilities": len(vulns),
             "total_assets":          len(assets),
+            "critical_count":        critical,
+            "high_count":            high,
         })
 
     # ── Compliance Check ─────────────────────────────────────────────────────────
@@ -182,7 +225,6 @@ def create_app():
                         "status":   "completed",
                         "progress": 100,
                     })
-                    # ── Send email alert after scan ──────────────────────────────
                     try:
                         from notifications import notify_scan_complete
                         notify_scan_complete(app, scan_id)
@@ -313,7 +355,6 @@ def create_app():
     @app.route("/api/settings/notifications", methods=["POST"])
     def save_notification_settings():
         data = request.get_json(force=True, silent=True) or {}
-        # Update config dynamically
         if data.get("alert_email"):
             app.config["ALERT_EMAIL"] = data["alert_email"]
         if data.get("mail_username"):
@@ -331,7 +372,6 @@ def create_app():
     def test_email():
         try:
             from notifications import send_scan_completion_email
-            # Send test using latest completed scan
             latest = Scan.query.filter_by(status="completed").order_by(Scan.id.desc()).first()
             if not latest:
                 return jsonify({"error": "No completed scans to test with"}), 400
