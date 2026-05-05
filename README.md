@@ -55,7 +55,7 @@ digital_twin_project/
 │       ├── context/         # Auth context (JWT)
 │       └── services/        # API, auth, socket services
 │
-└── frontend/                # ⚠️ IGNORE THIS FOLDER (empty, not used)
+└──
 ```
 
 ---
